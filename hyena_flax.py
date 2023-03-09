@@ -4,14 +4,13 @@ A complete version is available under `src.models.sequence.hyena`.
 """
 
 import math
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange
 
 
-def fftconv(u: torch.Tensor, k: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
+def fftconv(u, k, D):
     seqlen = u.shape[-1]
     fft_size = 2 * seqlen
 
@@ -32,7 +31,7 @@ def mul_sum(q, y):
 
 
 class Sin(nn.Module):
-    def __init__(self, dim: int, w: int = 10, train_freq: bool = True):
+    def __init__(self, dim, w=10, train_freq=True):
         super().__init__()
         self.freq = (
             nn.Parameter(w * torch.ones(1, dim))
@@ -40,12 +39,12 @@ class Sin(nn.Module):
             else w * torch.ones(1, dim)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return torch.sin(self.freq * x)
 
 
 class PositionalEmbedding(nn.Module):
-    def __init__(self, emb_dim: int, seq_len: int, lr_pos_emb: float = 1e-5) -> None:
+    def __init__(self, emb_dim: int, seq_len: int, lr_pos_emb: float = 1e-5):
         """Complex exponential positional embeddings for Hyena filters."""
         super().__init__()
 
@@ -68,22 +67,22 @@ class PositionalEmbedding(nn.Module):
 
         self.register_buffer("t", t)
 
-    def forward(self, L: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, L):
         return self.z[:, :L], self.t[:, :L]
 
 
 class ExponentialModulation(nn.Module):
     def __init__(
         self,
-        d_model: int,
-        fast_decay_pct: float = 0.3,
-        slow_decay_pct: float = 1.5,
-        target: float = 1e-2,
-        modulation_lr: float = 0.0,
+        d_model,
+        fast_decay_pct=0.3,
+        slow_decay_pct=1.5,
+        target=1e-2,
+        modulation_lr=0.0,
         modulate: bool = True,
         shift: float = 0.0,
         **_,
-    ) -> None:
+    ):
         super().__init__()
         self.modulate = modulate
         self.shift = shift
@@ -93,7 +92,7 @@ class ExponentialModulation(nn.Module):
         self.register_parameter("deltas", nn.Parameter(deltas))
         self.deltas._optim = {"lr": modulation_lr}
 
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, t, x):
         if self.modulate:
             decay = torch.exp(-t * self.deltas.abs())
             x = x * (decay + self.shift)
@@ -103,21 +102,21 @@ class ExponentialModulation(nn.Module):
 class HyenaFilter(nn.Module):
     def __init__(
         self,
-        d_model: int,
-        emb_dim: int = 3,  # dim of input to MLP, augments with positional encoding
-        order: int = 16,  # width of the implicit MLP
-        fused_fft_conv: bool = False,
-        seq_len: int = 1024,
-        lr: float = 1e-3,
-        lr_pos_emb: float = 1e-5,
-        dropout: float = 0.0,
-        w: int = 1,  # frequency of periodic activations
-        wd: int = 0,  # weight decay of kernel parameters
-        bias: bool = True,
-        num_inner_mlps: int = 2,
-        normalized: bool = False,
+        d_model,
+        emb_dim=3,  # dim of input to MLP, augments with positional encoding
+        order=16,  # width of the implicit MLP
+        fused_fft_conv=False,
+        seq_len=1024,
+        lr=1e-3,
+        lr_pos_emb=1e-5,
+        dropout=0.0,
+        w=1,  # frequency of periodic activations
+        wd=0,  # weight decay of kernel parameters
+        bias=True,
+        num_inner_mlps=2,
+        normalized=False,
         **kwargs,
-    ) -> None:
+    ):
         """
         Implicit long filter with modulation.
 
@@ -161,21 +160,13 @@ class HyenaFilter(nn.Module):
                 optim = {"weight_decay": wd, "lr": lr}
                 setattr(getattr(c, name), "_optim", optim)
 
-    def filter(self, L: int, *_, **__) -> torch.Tensor:
+    def filter(self, L, *_, **__):
         z, t = self.pos_emb(L)
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
         return h
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        L: int,
-        k: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
-        *_,
-        **__,
-    ) -> torch.Tensor:
+    def forward(self, x, L, k=None, bias=None, *_, **__):
         if k is None:
             k = self.filter(L)
 
@@ -189,14 +180,14 @@ class HyenaFilter(nn.Module):
 class HyenaOperator(nn.Module):
     def __init__(
         self,
-        d_model: int,
-        l_max: int,
-        order: int = 2,
-        filter_order: int = 64,
-        dropout: float = 0.0,
-        filter_dropout: float = 0.0,
+        d_model,
+        l_max,
+        order=2,
+        filter_order=64,
+        dropout=0.0,
+        filter_dropout=0.0,
         **filter_args,
-    ) -> None:
+    ):
         r"""
         Hyena operator described in the paper https://arxiv.org/pdf/2302.10866.pdf
 
@@ -228,7 +219,7 @@ class HyenaOperator(nn.Module):
             **filter_args,
         )
 
-    def forward(self, u: torch.Tensor, *_, **__) -> torch.Tensor:
+    def forward(self, u, *_, **__):
         l = u.size(-2)
         l_filter = min(l, self.l_max)
         u = self.in_proj(u)
@@ -251,7 +242,7 @@ class HyenaOperator(nn.Module):
         return y
 
 
-def main() -> None:
+def main():
     layer = HyenaOperator(d_model=512, l_max=1024, order=2, filter_order=64)
     x = torch.randn(1, 1024, 512, requires_grad=True)
     y = layer(x)
