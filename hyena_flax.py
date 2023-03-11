@@ -3,6 +3,7 @@ This is a slightly modified version of https://github.com/HazyResearch/safari/bl
 that I "cleaned up" to make it easier for me to port it
 """
 import jax.numpy as jnp
+from flax import linen as nn
 from jax import device_put
 from jaxtyping import Float
 
@@ -22,3 +23,20 @@ def fft_conv(
 
     out = y + u * jnp.expand_dims(D, -1)
     return device_put(out.astype(u.dtype))
+
+
+class Sin(nn.Module):
+    dim: int
+    input_freq: int = 10
+    train_freq: bool = True
+
+    def setup(self) -> None:
+        freq = self.input_freq
+        if self.train_freq:
+            self.param("freq", lambda: freq * jnp.ones(1, dim))
+        else:
+            self.variable("fixed", "freq", lambda: freq * jnp.ones(1, dim))
+
+    @nn.compact
+    def __call__(self, x: Float[jnp.ndarray, "b len ord"]) -> Float[jnp.ndarray, "b len ord"]:
+        return jnp.sin(self.freq * x)
