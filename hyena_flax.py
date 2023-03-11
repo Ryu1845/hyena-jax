@@ -68,3 +68,28 @@ class PositionalEmbedding(nn.Module):
 
         time_emb = self.variable("time_emb", "time_emb", lambda: time_emb)
         return z[:, :length], time_emb[:, :length]
+
+
+class ExponentialModulation(nn.Module):
+    width: int
+    fast_decay_pct: float = 0.3
+    slow_decay_pct: float = 1.5
+    target: float = 1e-2
+    modulation_lr: float = 0.0
+    modulate: bool = True
+    shift: float = 0.0
+
+    @nn.compact
+    def __call__(
+        self, t: Float[jnp.ndarray, "_ width _"], x: Float[jnp.ndarray, "_ width _"]
+    ) -> Float[jnp.ndarray, "_ width _"]:
+        max_decay = math.log(self.target) / self.fast_decay_pct
+        min_decay = math.log(self.target) / self.slow_decay_pct
+        deltas = jnp.linspace(min_decay, max_decay, self.width)[None, None]
+        self.param("deltas", lambda: deltas)
+        # self.deltas._optim = {"lr": modulation_lr}
+
+        if self.modulate:
+            decay = jnp.exp(-t * self.deltas.abs())
+            x = x * (decay + self.shift)
+        return x
