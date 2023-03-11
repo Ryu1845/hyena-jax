@@ -3,9 +3,11 @@ This is a slightly modified version of https://github.com/HazyResearch/safari/bl
 that I "cleaned up" to make it easier for me to port it
 """
 import math
-from typing import Tuple
+from typing import Tuple, Optional, Union
 
+import jax.nn
 import jax.numpy as jnp
+import jax.random as jr
 from flax import linen as nn
 from jax import device_put, lax
 from jaxtyping import Float
@@ -93,3 +95,78 @@ class ExponentialModulation(nn.Module):
             decay = jnp.exp(-t * self.deltas.abs())
             x = x * (decay + self.shift)
         return x
+
+
+class HyenaFilter(nn.Module):
+    """
+    Implicit long filter with modulation.
+
+    Args:
+        num_channels: number of channels in the input
+        emb_dim: dimension of the positional encoding (`emb_dim` - 1) // 2 is the number of bands
+        order: width of the FFN
+        num_inner_mlps: number of inner linear layers inside filter MLP
+    """
+
+    num_channels: int
+    emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
+    order: int = 16  # width of the implicit MLP
+    fused_fft_conv: bool = False
+    lr: float = 1e-3
+    lr_pos_emb: float = 1e-5
+    dropout: float = 0.0
+    freq: int = 1  # frequency of periodic activations
+    weight_decay: int = 0  # weight decay of kernel parameters
+    use_bias: bool = True
+    num_inner_mlps: int = 2
+    normalized: bool = False
+
+    @nn.compact
+    def __call__(
+        self,
+        x: Float[jnp.ndarray, "b width len"],
+        seq_len: int = 1024,
+        k: Optional[Union[Tuple, Float[jnp.ndarray, "width len"]]] = None,
+        bias: Optional[Float[jnp.ndarray, "width"]] = None,
+        **kwargs
+    ) -> Float[jnp.ndarray, "b width len"]:
+        key = jr.PRNGKey(0)
+        bias = self.param("bias", jax.nn.initializers.normal(), key, self.num_channels)
+        _dropout = nn.Dropout(self.dropout)
+
+        act = Sin(dim=self.order, freq=self.freq)
+        assert (
+            self.emb_dim % 2 != 0 and self.emb_dim >= 3
+        ), "emb_dim must be odd and greater or equal to 3 (time, sine and cosine)"
+        self.pos_emb = PositionalEmbedding(self.emb_dim, seq_len, self.lr_pos_emb)
+
+        self.implicit_filter = nn.Sequential(
+            nn.Dense(self.emb_dim, self.order),
+            act,
+        )
+        for _ in range(self.num_inner_mlps):
+            self.implicit_filter.append(nn.Dense(self.order, self.order))
+            self.implicit_filter.append(act)
+
+        self.implicit_filter.append(nn.Dense(self.order, self.num_channels, bias=False))
+
+        self.modulation = ExponentialModulation(self.num_channels, **kwargs)
+
+        # for c in self.implicit_filter.children():
+        #     for name, v in c.state_dict().items():
+        #         optim = {"weight_decay": self.weight_decay, "lr": lr}
+        #         setattr(getattr(c, name), "_optim", optim)
+
+        if k is None:
+            k = self.filter(seq_len)
+        # Ensure compatibility with filters that return a tuple
+        k = k[0] if isinstance(k, tuple) else k
+
+        y = fft_conv(x, k, bias)
+        return y
+
+    def filter(self, seq_len: int, *_, **__) -> Float[jnp.ndarray, "b len width"]:
+        z, t = self.pos_emb(seq_len)
+        h = self.implicit_filter(z)
+        h = self.modulation(t, h)
+        return h
