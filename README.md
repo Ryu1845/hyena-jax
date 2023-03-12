@@ -1,2 +1,2 @@
 # hyena-jax
-Implementation of Hyena Hierarchy in JAX
+[WIP] Implementation of Hyena Hierarchy in JAX
