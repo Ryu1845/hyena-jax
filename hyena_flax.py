@@ -8,6 +8,7 @@ from typing import Tuple, Optional, Union
 import jax.nn
 import jax.numpy as jnp
 import jax.random as jr
+from einops import rearrange
 from flax import linen as nn
 from jax import device_put, lax
 from jaxtyping import Float
@@ -128,7 +129,7 @@ class HyenaFilter(nn.Module):
         seq_len: int = 1024,
         k: Optional[Union[Tuple, Float[jnp.ndarray, "width len"]]] = None,
         bias: Optional[Float[jnp.ndarray, "width"]] = None,
-        **kwargs
+        **kwargs,
     ) -> Float[jnp.ndarray, "b width len"]:
         key = jr.PRNGKey(0)
         bias = self.param("bias", jax.nn.initializers.normal(), key, self.num_channels)
@@ -170,3 +171,79 @@ class HyenaFilter(nn.Module):
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
         return h
+
+
+class HyenaOperator(nn.Module):
+    width: int
+    max_len: int
+    order: int = 2
+    filter_order: int = 64
+    dropout: float = 0.0
+    filter_dropout: float = 0.0
+
+    @nn.compact
+    def __call__(
+        self, input_seq: Float[jnp.ndarray, "b len width"], *_, **filter_args
+    ) -> Float[jnp.ndarray, "b len width"]:
+        r"""
+        Hyena operator described in the paper https://arxiv.org/pdf/2302.10866.pdf
+
+        Args:
+            width (int): Dimension of the input and output embeddings (width of the layer)
+            max_input_len: (int): Maximum input sequence length. Defaults to None
+            order: (int): Depth of the Hyena recurrence. Defaults to 2
+            dropout: (float): Dropout probability. Defaults to 0.0
+            filter_dropout: (float): Dropout probability for the filter. Defaults to 0.0
+        """
+        inner_width = self.width * (self.order + 1)
+        dropout = nn.Dropout(self.dropout)
+        in_proj = nn.Dense(self.width, inner_width)
+        out_proj = nn.Dense(self.width, self.width)
+
+        short_filter = nn.Conv(inner_width, inner_width, 3, padding=2, groups=inner_width)
+        filter_fn = HyenaFilter(
+            self.width * (self.order - 1),
+            order=self.filter_order,
+            seq_len=self.max_len,
+            channels=1,
+            dropout=self.filter_dropout,
+            **filter_args,
+        )
+
+        seq_len = self.input_seq.size(-2)
+        seq_len = min(seq_len, self.max_len)
+        input_seq = in_proj(input_seq)
+        input_seq = rearrange(input_seq, "b len width -> b width len")
+
+        uc = short_filter(input_seq)[..., :seq_len]
+        *x, v = uc.split(self.width, dim=1)
+
+        k = filter_fn.filter(seq_len)[0]
+        k = rearrange(k, "len (ord width) -> ord width len", ord=self.order - 1)
+        bias = rearrange(filter_fn.bias, "(ord width) -> ord width", ord=self.order - 1)
+
+        for o, x_i in enumerate(reversed(x[1:])):
+            v = dropout(v * x_i)
+            v = filter_fn(v, seq_len, k=k[o], bias=bias[o])
+
+        y = rearrange(v * x[0], "b width len -> b len width")
+
+        y = out_proj(y)
+        return y
+
+
+def main() -> None:
+    layer = HyenaOperator(width=1024, max_len=2048, order=2, filter_order=64)
+    key = jr.PRNGKey(0)
+    x = jr.normal(key, (4, 2048, 1024))
+    y = layer(x)
+
+    print(x.shape, y.shape)
+
+    # grad = torch.autograd.grad(y[:, 10, :].sum(), x)[0]
+    # print('Causality check: gradients should not flow "from future to past"')
+    # print(grad[0, 11, :].sum(), grad[0, 9, :].sum())
+
+
+if __name__ == "__main__":
+    main()
