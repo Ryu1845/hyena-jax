@@ -10,24 +10,24 @@ import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
 from flax import linen as nn
-from jax import device_put, lax
+from jax import device_put, lax, Array
 from jaxtyping import Float
 
 KEY = jr.PRNGKey(0)
 
 
 def fft_conv(
-    u: Float[jnp.ndarray, "b width len"], k: Float[jnp.ndarray, "width len"], D: Float[jnp.ndarray, "width"]
-) -> Float[jnp.ndarray, "b width len"]:
-    sequence_length = u.shape[-1]
-    fft_size = 2 * sequence_length
+    u: Float[Array, "batch width length"], k: Float[Array, "width length"], D: Float[Array, "width"]
+) -> Float[Array, "batch width length"]:
+    seq_len = u.shape[-1]
+    fft_size = 2 * seq_len
 
     k_f = jnp.fft.rfft(k, n=fft_size) / fft_size
     u_f = jnp.fft.rfft(device_put(u.astype(k.dtype)), n=fft_size)
 
     if len(u.shape) > 3:
         k_f = jnp.expand_dims(k_f, 1)
-    y = jnp.fft.irfft(u_f * k_f, n=fft_size, norm="forward")[..., :sequence_length]
+    y = jnp.fft.irfft(u_f * k_f, n=fft_size, norm="forward")[..., :seq_len]
 
     out = y + u * jnp.expand_dims(D, -1)
     return device_put(out.astype(u.dtype))
@@ -38,7 +38,7 @@ class Sin(nn.Module):
     freq: int = 10
 
     @nn.compact
-    def __call__(self, x: Float[jnp.ndarray, "b len ord"], train: bool = True) -> Float[jnp.ndarray, "b len ord"]:
+    def __call__(self, x: Float[Array, "batch length ord"], train: bool = True) -> Float[Array, "batch length ord"]:
         if train:
             freq = self.param("freq", lambda _: self.freq * jnp.ones((1, self.dim)))
         else:
@@ -53,7 +53,7 @@ class PositionalEmbedding(nn.Module):
     lr_pos_emb: float = 1e-5
 
     @nn.compact
-    def __call__(self, length: int) -> Tuple[Float[jnp.ndarray, "_ width _"], Float[jnp.ndarray, "_ width _"]]:
+    def __call__(self, length: int) -> Tuple[Float[Array, "_ width _"], Float[Array, "_ width _"]]:
         """Complex exponential positional embeddings for Hyena filters."""
         # The time embedding fed to the filters is normalized so that t_f = 1
 
@@ -86,9 +86,7 @@ class ExponentialModulation(nn.Module):
     shift: float = 0.0
 
     @nn.compact
-    def __call__(
-        self, t: Float[jnp.ndarray, "_ width _"], x: Float[jnp.ndarray, "_ width _"]
-    ) -> Float[jnp.ndarray, "_ width _"]:
+    def __call__(self, t: Float[Array, "_ width _"], x: Float[Array, "_ width _"]) -> Float[Array, "_ width _"]:
         def deltas_func(_):
             max_decay = math.log(self.target) / self.fast_decay_pct
             min_decay = math.log(self.target) / self.slow_decay_pct
@@ -130,7 +128,7 @@ class HyenaFilter(nn.Module):
     normalized: bool = False
 
     def setup(self):
-        self.bias = self.param("bias", jax.nn.initializers.normal(), (self.num_channels,), jnp.float32)
+        self.bias = self.param("batchias", jax.nn.initializers.normal(), (self.num_channels,), jnp.float32)
         self.dropout = nn.Dropout(self.dropout_p)
         act = Sin(dim=self.order)
         assert (
@@ -147,12 +145,12 @@ class HyenaFilter(nn.Module):
 
     def __call__(
         self,
-        x: Float[jnp.ndarray, "b width len"],
+        x: Float[Array, "batch width length"],
         seq_len: int = 1024,
-        k: Optional[Union[Tuple, Float[jnp.ndarray, "width len"]]] = None,
-        bias: Optional[Float[jnp.ndarray, "width"]] = None,
+        k: Optional[Union[Tuple, Float[Array, "width length"]]] = None,
+        bias: Optional[Float[Array, "width"]] = None,
         **kwargs,
-    ) -> Float[jnp.ndarray, "b width len"]:
+    ) -> Float[Array, "batch width length"]:
         if k is None:
             k = self.filter(seq_len)
         # Ensure compatibility with filters that return a tuple
@@ -161,7 +159,7 @@ class HyenaFilter(nn.Module):
         y = fft_conv(x, k, bias)
         return y
 
-    def filter(self, seq_len: int) -> Float[jnp.ndarray, "b len width"]:
+    def filter(self, seq_len: int) -> Float[Array, "batch length width"]:
         z, t = self.pos_emb(seq_len)
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
@@ -178,8 +176,8 @@ class HyenaOperator(nn.Module):
 
     @nn.compact
     def __call__(
-        self, input_seq: Float[jnp.ndarray, "b len width"], *_, **filter_args
-    ) -> Float[jnp.ndarray, "b len width"]:
+        self, input_seq: Float[Array, "batch length width"], *_, **filter_args
+    ) -> Float[Array, "batch length width"]:
         r"""
         Hyena operator described in the paper https://arxiv.org/pdf/2302.10866.pdf
 
@@ -209,18 +207,18 @@ class HyenaOperator(nn.Module):
 
         short_filter = nn.Conv(inner_width, kernel_size=(3,), padding=2, feature_group_count=inner_width)
         uc = short_filter(input_seq)
-        uc = rearrange(uc, "b len width -> b width len")[..., :seq_len]
+        uc = rearrange(uc, "batch length width -> batch width length")[..., :seq_len]
         *x, v = jnp.split(uc, uc.shape[1] // self.width, axis=1)
 
         k = filter_fn.filter(seq_len)[0]
-        k = rearrange(k, "len (ord width) -> ord width len", ord=self.order - 1)
+        k = rearrange(k, "length (ord width) -> ord width length", ord=self.order - 1)
         bias = rearrange(filter_fn.bias, "(ord width) -> ord width", ord=self.order - 1)
 
         for o, x_i in enumerate(reversed(x[1:])):
             v = dropout(v * x_i)
             v = filter_fn(v, seq_len, k=k[o], bias=bias[o])
 
-        y = rearrange(v * x[0], "b width len -> b len width")
+        y = rearrange(v * x[0], "batch width length -> batch length width")
 
         y = out_proj(y)
         return y

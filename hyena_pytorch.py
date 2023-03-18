@@ -16,8 +16,8 @@ torch.manual_seed(0)
 
 
 def fft_conv(
-    u: Float[Tensor, "b width len"], k: Float[Tensor, "width len"], D: Float[Tensor, "width"]
-) -> Float[Tensor, "b width len"]:
+    u: Float[Tensor, "batch width len"], k: Float[Tensor, "width len"], D: Float[Tensor, "width"]
+) -> Float[Tensor, "batch width len"]:
     sequence_length = u.shape[-1]
     fft_size = 2 * sequence_length
 
@@ -37,7 +37,7 @@ class Sin(nn.Module):
         super().__init__()
         self.freq = nn.Parameter(freq * torch.ones(1, dim)) if train_freq else freq * torch.ones(1, dim)
 
-    def forward(self, x: Float[Tensor, "b len ord"]) -> Float[Tensor, "b len ord"]:
+    def forward(self, x: Float[Tensor, "batch len ord"]) -> Float[Tensor, "batch len ord"]:
         return torch.sin(self.freq * x)
 
 
@@ -157,7 +157,7 @@ class HyenaFilter(nn.Module):
                 optim = {"weight_decay": weight_decay, "lr": lr}
                 setattr(getattr(c, name), "_optim", optim)
 
-    def filter(self, seq_len: int, *_, **__) -> Float[Tensor, "b len width"]:
+    def filter(self, seq_len: int, *_, **__) -> Float[Tensor, "batch len width"]:
         z, t = self.pos_emb(seq_len)
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
@@ -165,13 +165,13 @@ class HyenaFilter(nn.Module):
 
     def forward(
         self,
-        x: Float[Tensor, "b width len"],
+        x: Float[Tensor, "batch width len"],
         seq_len: int,
         k: Optional[Union[Tuple, Float[Tensor, "width len"]]] = None,
         bias: Optional[Float[Tensor, "width"]] = None,
         *_,
         **__,
-    ) -> Float[Tensor, "b width len"]:
+    ) -> Float[Tensor, "batch width len"]:
         if k is None:
             k = self.filter(seq_len)
 
@@ -221,11 +221,11 @@ class HyenaOperator(nn.Module):
             **filter_args,
         )
 
-    def forward(self, input_seq: Float[Tensor, "b len width"], *_, **__) -> Float[Tensor, "b len width"]:
+    def forward(self, input_seq: Float[Tensor, "batch len width"], *_, **__) -> Float[Tensor, "batch len width"]:
         seq_len = input_seq.size(-2)
         seq_len = min(seq_len, self.max_len)
         input_seq = self.in_proj(input_seq)
-        input_seq = rearrange(input_seq, "b len width -> b width len")
+        input_seq = rearrange(input_seq, "batch len width -> batch width len")
 
         uc = self.short_filter(input_seq)[..., :seq_len]
         *x, v = uc.split(self.width, dim=1)
@@ -238,7 +238,7 @@ class HyenaOperator(nn.Module):
             v = self.dropout(v * x_i)
             v = self.filter_fn(v, seq_len, k=k[o], bias=bias[o])
 
-        y = rearrange(v * x[0], "b width len -> b len width")
+        y = rearrange(v * x[0], "batch width len -> batch len width")
 
         y = self.out_proj(y)
         return y
