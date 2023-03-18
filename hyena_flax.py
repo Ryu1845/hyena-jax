@@ -230,14 +230,9 @@ def main() -> None:
     layer = HyenaOperator(width=1024, max_len=2048, order=2, filter_order=64)
     x = jr.normal(KEY, (4, 2048, 1024))
     variables = layer.init(KEY, x)
-    layer.apply(variables, jnp.ones((5, 5)))
-    y = layer(x)
+    y = layer.apply(variables, x)
 
     print(x.shape, y.shape)
-
-    # grad = torch.autograd.grad(y[:, 10, :].sum(), x)[0]
-    # print('Causality check: gradients should not flow "from future to past"')
-    # print(grad[0, 11, :].sum(), grad[0, 9, :].sum())
 
 
 if __name__ == "__main__":

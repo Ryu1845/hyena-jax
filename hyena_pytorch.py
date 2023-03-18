@@ -21,7 +21,6 @@ def fft_conv(
     sequence_length = u.shape[-1]
     fft_size = 2 * sequence_length
 
-    print(u.size(), k.size())
     k_f = torch.fft.rfft(k, n=fft_size) / fft_size
     u_f = torch.fft.rfft(u.to(dtype=k.dtype), n=fft_size)
 
