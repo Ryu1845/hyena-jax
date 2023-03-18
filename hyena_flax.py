@@ -2,7 +2,6 @@
 Port of the standalone hyena from pytorch to flax
 """
 import math
-from functools import partial
 from typing import Tuple, Optional, Union
 
 import jax.nn
@@ -61,7 +60,7 @@ class PositionalEmbedding(nn.Module):
             "time_emb", "time_emb", lambda: jnp.linspace(0, 1, self.seq_len)[None, :, None]
         ).value  # 1, seq_len, 1
 
-        def z_func(_):
+        def z_init(_):
             bands = (self.emb_dim - 1) // 2
             # To compute the right embeddings we use the "proper" linspace
             t_rescaled = jnp.linspace(0, self.seq_len - 1, self.seq_len)[None, :, None]
@@ -71,7 +70,7 @@ class PositionalEmbedding(nn.Module):
             _z = lax.concatenate([time_emb, _z.real, _z.imag], dimension=2)
             return _z
 
-        z = self.param("z", z_func)
+        z = self.param("z", z_init)
         # self.z._optim = {"lr": self.lr_pos_emb}
         return z[:, :length], time_emb[:, :length]
 
@@ -87,13 +86,13 @@ class ExponentialModulation(nn.Module):
 
     @nn.compact
     def __call__(self, t: Float[Array, "_ width _"], x: Float[Array, "_ width _"]) -> Float[Array, "_ width _"]:
-        def deltas_func(_):
+        def deltas_init(_):
             max_decay = math.log(self.target) / self.fast_decay_pct
             min_decay = math.log(self.target) / self.slow_decay_pct
             deltas = jnp.linspace(min_decay, max_decay, self.width)[None, None]
             return deltas
 
-        deltas = self.param("deltas", deltas_func)
+        deltas = self.param("deltas", deltas_init)
         # self.deltas._optim = {"lr": modulation_lr}
 
         if self.modulate:
@@ -226,8 +225,9 @@ class HyenaOperator(nn.Module):
 
 def main() -> None:
     layer = HyenaOperator(width=1024, max_len=2048, order=2, filter_order=64)
-    x = jr.normal(KEY, (4, 2048, 1024))
-    variables = layer.init(KEY, x)
+    x_key, init_key = jr.split(KEY)
+    x = jr.normal(x_key, (4, 2048, 1024))
+    variables = layer.init(init_key, x)
     y = layer.apply(variables, x)
 
     print(x.shape, y.shape)
