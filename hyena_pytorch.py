@@ -12,6 +12,8 @@ from einops import rearrange
 from jaxtyping import Float, jaxtyped
 from torch import Tensor
 
+torch.manual_seed(0)
+
 
 def fft_conv(
     u: Float[Tensor, "b width len"], k: Float[Tensor, "width len"], D: Float[Tensor, "width"]
@@ -19,6 +21,7 @@ def fft_conv(
     sequence_length = u.shape[-1]
     fft_size = 2 * sequence_length
 
+    print(u.size(), k.size())
     k_f = torch.fft.rfft(k, n=fft_size) / fft_size
     u_f = torch.fft.rfft(u.to(dtype=k.dtype), n=fft_size)
 
@@ -215,7 +218,6 @@ class HyenaOperator(nn.Module):
             width * (order - 1),
             order=filter_order,
             seq_len=max_input_len,
-            channels=1,
             dropout=filter_dropout,
             **filter_args,
         )

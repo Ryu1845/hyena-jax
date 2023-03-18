@@ -1,8 +1,8 @@
 """
-This is a slightly modified version of https://github.com/HazyResearch/safari/blob/main/standalone_hyena.py
-that I "cleaned up" to make it easier for me to port it
+Port of the standalone hyena from pytorch to flax
 """
 import math
+from functools import partial
 from typing import Tuple, Optional, Union
 
 import jax.nn
@@ -12,6 +12,8 @@ from einops import rearrange
 from flax import linen as nn
 from jax import device_put, lax
 from jaxtyping import Float
+
+KEY = jr.PRNGKey(0)
 
 
 def fft_conv(
@@ -33,15 +35,14 @@ def fft_conv(
 
 class Sin(nn.Module):
     dim: int
+    freq: int = 10
 
     @nn.compact
-    def __call__(
-        self, x: Float[jnp.ndarray, "b len ord"], freq: int = 10, train: bool = True
-    ) -> Float[jnp.ndarray, "b len ord"]:
+    def __call__(self, x: Float[jnp.ndarray, "b len ord"], train: bool = True) -> Float[jnp.ndarray, "b len ord"]:
         if train:
-            freq = self.param("freq", lambda: freq * jnp.ones(1, self.dim))
+            freq = self.param("freq", lambda _: self.freq * jnp.ones((1, self.dim)))
         else:
-            freq_var = self.variable("fixed", "freq", lambda: freq * jnp.ones(1, self.dim))
+            freq_var = self.variable("fixed", "freq", lambda: self.freq * jnp.ones(1, self.dim))
             freq = freq_var.value
         return jnp.sin(freq * x)
 
@@ -55,21 +56,23 @@ class PositionalEmbedding(nn.Module):
     def __call__(self, length: int) -> Tuple[Float[jnp.ndarray, "_ width _"], Float[jnp.ndarray, "_ width _"]]:
         """Complex exponential positional embeddings for Hyena filters."""
         # The time embedding fed to the filters is normalized so that t_f = 1
-        time_emb = jnp.linspace(0, 1, self.seq_len)[None, :, None]  # 1, seq_len, 1
 
-        bands = (self.emb_dim - 1) // 2
-        # To compute the right embeddings we use the "proper" linspace
-        t_rescaled = jnp.linspace(0, self.seq_len - 1, self.seq_len)[None, :, None]
-        w = 2 * math.pi * t_rescaled / self.seq_len  # 1, seq_len, 1
+        time_emb = self.variable(
+            "time_emb", "time_emb", lambda: jnp.linspace(0, 1, self.seq_len)[None, :, None]
+        ).value  # 1, seq_len, 1
 
-        f = jnp.linspace(1e-4, bands - 1, bands)[None, None]
-        z = jnp.exp(-1j * f * w)
-        z = lax.concatenate([time_emb, z.real, z.imag], dimension=-1)
+        def z_func(_):
+            bands = (self.emb_dim - 1) // 2
+            # To compute the right embeddings we use the "proper" linspace
+            t_rescaled = jnp.linspace(0, self.seq_len - 1, self.seq_len)[None, :, None]
+            w = 2 * math.pi * t_rescaled / self.seq_len  # 1, seq_len, 1
+            f = jnp.linspace(1e-4, bands - 1, bands)[None, None]
+            _z = jnp.exp(-1j * f * w)
+            _z = lax.concatenate([time_emb, _z.real, _z.imag], dimension=2)
+            return _z
 
-        z = self.param("z", lambda: z)
+        z = self.param("z", z_func)
         # self.z._optim = {"lr": self.lr_pos_emb}
-
-        time_emb = self.variable("time_emb", "time_emb", lambda: time_emb)
         return z[:, :length], time_emb[:, :length]
 
 
@@ -86,14 +89,17 @@ class ExponentialModulation(nn.Module):
     def __call__(
         self, t: Float[jnp.ndarray, "_ width _"], x: Float[jnp.ndarray, "_ width _"]
     ) -> Float[jnp.ndarray, "_ width _"]:
-        max_decay = math.log(self.target) / self.fast_decay_pct
-        min_decay = math.log(self.target) / self.slow_decay_pct
-        deltas = jnp.linspace(min_decay, max_decay, self.width)[None, None]
-        self.param("deltas", lambda: deltas)
+        def deltas_func(_):
+            max_decay = math.log(self.target) / self.fast_decay_pct
+            min_decay = math.log(self.target) / self.slow_decay_pct
+            deltas = jnp.linspace(min_decay, max_decay, self.width)[None, None]
+            return deltas
+
+        deltas = self.param("deltas", deltas_func)
         # self.deltas._optim = {"lr": modulation_lr}
 
         if self.modulate:
-            decay = jnp.exp(-t * self.deltas.abs())
+            decay = jnp.exp(-t * jnp.abs(deltas))
             x = x * (decay + self.shift)
         return x
 
@@ -111,18 +117,34 @@ class HyenaFilter(nn.Module):
 
     num_channels: int
     emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
+    seq_len: int = 1024
     order: int = 16  # width of the implicit MLP
     fused_fft_conv: bool = False
     lr: float = 1e-3
     lr_pos_emb: float = 1e-5
-    dropout: float = 0.0
+    dropout_p: float = 0.0
     freq: int = 1  # frequency of periodic activations
     weight_decay: int = 0  # weight decay of kernel parameters
     use_bias: bool = True
     num_inner_mlps: int = 2
     normalized: bool = False
 
-    @nn.compact
+    def setup(self):
+        self.bias = self.param("bias", jax.nn.initializers.normal(), (self.num_channels,), jnp.float32)
+        self.dropout = nn.Dropout(self.dropout_p)
+        act = Sin(dim=self.order)
+        assert (
+            self.emb_dim % 2 != 0 and self.emb_dim >= 3
+        ), "emb_dim must be odd and greater or equal to 3 (time, sine and cosine)"
+        self.pos_emb = PositionalEmbedding(self.emb_dim, self.seq_len, self.lr_pos_emb)
+
+        self.implicit_filter = nn.Sequential(
+            [i for _ in range(self.num_inner_mlps + 1) for i in (nn.Dense(self.order), act)]
+            + [nn.Dense(self.num_channels, use_bias=False)]
+        )
+
+        self.modulation = ExponentialModulation(self.num_channels)
+
     def __call__(
         self,
         x: Float[jnp.ndarray, "b width len"],
@@ -131,33 +153,6 @@ class HyenaFilter(nn.Module):
         bias: Optional[Float[jnp.ndarray, "width"]] = None,
         **kwargs,
     ) -> Float[jnp.ndarray, "b width len"]:
-        key = jr.PRNGKey(0)
-        bias = self.param("bias", jax.nn.initializers.normal(), key, self.num_channels)
-        _dropout = nn.Dropout(self.dropout)
-
-        act = Sin(dim=self.order, freq=self.freq)
-        assert (
-            self.emb_dim % 2 != 0 and self.emb_dim >= 3
-        ), "emb_dim must be odd and greater or equal to 3 (time, sine and cosine)"
-        self.pos_emb = PositionalEmbedding(self.emb_dim, seq_len, self.lr_pos_emb)
-
-        self.implicit_filter = nn.Sequential(
-            nn.Dense(self.emb_dim, self.order),
-            act,
-        )
-        for _ in range(self.num_inner_mlps):
-            self.implicit_filter.append(nn.Dense(self.order, self.order))
-            self.implicit_filter.append(act)
-
-        self.implicit_filter.append(nn.Dense(self.order, self.num_channels, bias=False))
-
-        self.modulation = ExponentialModulation(self.num_channels, **kwargs)
-
-        # for c in self.implicit_filter.children():
-        #     for name, v in c.state_dict().items():
-        #         optim = {"weight_decay": self.weight_decay, "lr": lr}
-        #         setattr(getattr(c, name), "_optim", optim)
-
         if k is None:
             k = self.filter(seq_len)
         # Ensure compatibility with filters that return a tuple
@@ -166,7 +161,7 @@ class HyenaFilter(nn.Module):
         y = fft_conv(x, k, bias)
         return y
 
-    def filter(self, seq_len: int, *_, **__) -> Float[jnp.ndarray, "b len width"]:
+    def filter(self, seq_len: int) -> Float[jnp.ndarray, "b len width"]:
         z, t = self.pos_emb(seq_len)
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
@@ -196,27 +191,26 @@ class HyenaOperator(nn.Module):
             filter_dropout: (float): Dropout probability for the filter. Defaults to 0.0
         """
         inner_width = self.width * (self.order + 1)
-        dropout = nn.Dropout(self.dropout)
-        in_proj = nn.Dense(self.width, inner_width)
-        out_proj = nn.Dense(self.width, self.width)
+        dropout = nn.Dropout(self.dropout, deterministic=True)
+        in_proj = nn.Dense(inner_width)
+        out_proj = nn.Dense(self.width)
 
-        short_filter = nn.Conv(inner_width, inner_width, 3, padding=2, groups=inner_width)
         filter_fn = HyenaFilter(
             self.width * (self.order - 1),
-            order=self.filter_order,
             seq_len=self.max_len,
-            channels=1,
-            dropout=self.filter_dropout,
+            order=self.filter_order,
+            dropout_p=self.filter_dropout,
             **filter_args,
         )
 
-        seq_len = self.input_seq.size(-2)
+        seq_len = input_seq.shape[-2]
         seq_len = min(seq_len, self.max_len)
         input_seq = in_proj(input_seq)
-        input_seq = rearrange(input_seq, "b len width -> b width len")
 
-        uc = short_filter(input_seq)[..., :seq_len]
-        *x, v = uc.split(self.width, dim=1)
+        short_filter = nn.Conv(inner_width, kernel_size=(3,), padding=2, feature_group_count=inner_width)
+        uc = short_filter(input_seq)
+        uc = rearrange(uc, "b len width -> b width len")[..., :seq_len]
+        *x, v = jnp.split(uc, uc.shape[1] // self.width, axis=1)
 
         k = filter_fn.filter(seq_len)[0]
         k = rearrange(k, "len (ord width) -> ord width len", ord=self.order - 1)
@@ -234,8 +228,9 @@ class HyenaOperator(nn.Module):
 
 def main() -> None:
     layer = HyenaOperator(width=1024, max_len=2048, order=2, filter_order=64)
-    key = jr.PRNGKey(0)
-    x = jr.normal(key, (4, 2048, 1024))
+    x = jr.normal(KEY, (4, 2048, 1024))
+    variables = layer.init(KEY, x)
+    layer.apply(variables, jnp.ones((5, 5)))
     y = layer(x)
 
     print(x.shape, y.shape)
