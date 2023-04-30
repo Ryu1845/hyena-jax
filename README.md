@@ -1,5 +1,5 @@
 # hyena-jax
-[WIP] Port of Hyena Hierarchy to JAX
+Port of Hyena Hierarchy to JAX
 
 Original: https://github.com/HazyResearch/safari/blob/main/standalone_hyena.py
 
